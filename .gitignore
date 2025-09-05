@@ -1,4 +1,4 @@
 build/
 dist/
-winpwn.egg-info/
-winpwn/__pycache__
+wpwn.egg-info/
+wpwn/__pycache__
