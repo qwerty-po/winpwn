@@ -1,47 +1,40 @@
-from .misc import Latin1_decode
+import lief
 
-class winfile(object):
-    def __init__(self,fpath=""):
-        self._address=0
-        self.imsyms={}
-        self.exsyms={}
-        self.symbols={}
-        self.update(fpath)
-    def update(self,fpath):
-        import pefile
-        pe=pefile.PE(fpath)
-        if hasattr(pe,"DIRECTORY_ENTRY_IMPORT"):
-            for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                # l={}
-                # print(entry.dll)
-                for imp in entry.imports:
-                    self.imsyms.update({
-                            Latin1_decode(imp.name):self._address+imp.address-pe.OPTIONAL_HEADER.ImageBase,
-                        }
-                    )
-        if hasattr(pe,"DIRECTORY_ENTRY_EXPORT"):
-            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-                # print(hex(pe.DIRECTORY_ENTRY_EXPORT.struct.AddressOfFunctions+4*(exp.ordinal-1)))
-                # print(hex(exp.address))         # EAT element value
-                # print(exp.name)                  # str: funcname
-                self.exsyms.update({
-                        Latin1_decode(exp.name):self._address+pe.DIRECTORY_ENTRY_EXPORT.struct.AddressOfFunctions+4*(exp.ordinal-1)
-                    }
-                )
-        self.symbols.update(self.exsyms)
-        self.symbols.update(self.imsyms)
-    
-    @property
-    def address(self):
-        return self._address
-    @address.setter
-    def address(self,base):
-        self._address=base
-        for sym in self.imsyms:
-            self.imsyms.update({sym:base+self.imsyms[sym]})
-        for sym in self.exsyms:
-            self.exsyms.update({sym:base+self.exsyms[sym]})
-        self.symbols.update(self.exsyms)
-        self.symbols.update(self.imsyms)
-        
+class PE:
+    def __init__(self, path):
+        self.pe = lief.PE.parse(path)
+        self.address = self.pe.optional_header.imagebase
+        self._exports = {}
+        if self.pe.has_exports:
+            exp = self.pe.get_export()
+            for e in exp.entries:
+                if e.name:
+                    self._exports[e.name] = e.address  
+
+    def _rva_to_file_offset(self, rva):
+        for s in self.pe.sections:
+            va = s.virtual_address
+            rsz = s.sizeof_raw_data or 0
+            vsz = s.virtual_size or 0
+            span = max(rsz, vsz)
+            if va <= rva < va + span:
+                return (rva - va) + (s.pointerto_raw_data or 0)
+        return None
+
+    def __getitem__(self, key):
+        if key == "imagebase":
+            return self.address
+        if key == "entrypoint":
+            return self._rva_to_file_offset(self.pe.optional_header.addressof_entrypoint)
+        if key == "sections":
+            return [s.name for s in self.pe.sections]
+        if isinstance(key, str):
+            rva = self._exports.get(key)
+            if rva is None:
+                raise KeyError(key)
+            off = self._rva_to_file_offset(rva)
+            if off is None:
+                raise KeyError(key)
+            return off
+        raise KeyError(key)
             
