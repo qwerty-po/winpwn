@@ -383,11 +383,8 @@ class PE:
         va = self.address + rva
         return {"name": name, "rva": rva, "va": va, "offset": off}
     
-    def _find_string_va_in_pe(self, s: str, encoding="utf-8", add_null=True):
+    def find_string(self, s: str, encoding="utf-8", add_null=True):
         needle = s.encode(encoding) + (b"\x00" if add_null else b"")
-
-        imagebase = self.pe.optional_header.imagebase  # PE ImageBase
-        hits = []
 
         for sec in self.pe.sections:
             data = bytes(sec.content)  # 섹션 raw bytes
@@ -398,19 +395,7 @@ class PE:
                     break
 
                 rva = sec.virtual_address + idx
-                va  = imagebase + rva
-
-                hits.append({
-                    "section": sec.name,
-                    "offset_in_section": idx,
-                    "rva": rva,
-                    "va": va,
-                })
+                va  = self.address + rva
+                
+                yield va
                 pos = idx + 1
-
-        return hits
-    
-    def find_string(self, s: str, encoding="utf-8", add_null=True):
-        hits = self._find_string_va_in_pe(s, encoding, add_null)
-        for h in hits:
-            yield h["va"]
