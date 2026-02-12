@@ -289,7 +289,7 @@ class PE:
         ia = self._imports.get(name)
         if ia is None:
             raise KeyError(f"import not found: {name}")
-        return ia
+        return ia + self.address
 
     def _extract_rsds(self):
         for d in self.pe.debug:
