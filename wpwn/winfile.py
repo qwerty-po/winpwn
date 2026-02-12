@@ -1,6 +1,5 @@
 import atexit
 import ctypes
-import os
 import pathlib
 import struct
 import tempfile
@@ -44,12 +43,19 @@ def _is_apiset(name: str) -> bool:
     return n.startswith("api-ms-") or n.startswith("ext-ms-")
 
 
-class SymbolStore:
+class _GlobalSymbolStore:
     """
-    Per-PE symbol store that downloads PDB into a symserver-like layout:
-      <root>\<pdb_name>\<GUIDAGE>\<pdb_name>
-    and returns <root> for adding to dbghelp search path.
+    One temp root for the whole process, symserver layout:
+      <root>\<pdb>\<GUIDAGE>\<pdb>
     """
+    _inst = None
+
+    @classmethod
+    def inst(cls):
+        if cls._inst is None:
+            cls._inst = _GlobalSymbolStore()
+        return cls._inst
+
     def __init__(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="symstore_")
         self.root = pathlib.Path(self._tmp.name)
@@ -79,18 +85,26 @@ class SymbolStore:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+
         return out_path
 
 
-class DbgHelpResolver:
+class _DbgHelpResolver:
     """
-    Single dbghelp handler for the process (DbgHelp is process-global).
-    This class makes it safe for multiple PE instances by:
-      - never calling SymCleanup except at process exit
-      - maintaining a superset search path (only expands)
-      - assigning a unique fake base per loaded offline module to avoid collisions
-      - always querying with 'module!symbol'
+    DbgHelp is process-global. This resolver makes usage order-independent by:
+      - initializing once
+      - search path is a superset (only grows)
+      - each offline module gets a unique fake base (avoids collisions)
+      - queries always use 'module!symbol'
     """
+    _inst = None
+
+    @classmethod
+    def inst(cls):
+        if cls._inst is None:
+            cls._inst = _DbgHelpResolver()
+        return cls._inst
+
     SYMOPT_UNDNAME = 0x00000002
     SYMOPT_DEFERRED_LOADS = 0x00000004
     SYMOPT_FAIL_CRITICAL_ERRORS = 0x00000200
@@ -172,8 +186,8 @@ class DbgHelpResolver:
         self._search_dirs = []
         self._modbase_by_path = {}
 
-        self._next_base = 0x0000000200000000  # 8GB
-        self._base_step = 0x02000000          # 32MB
+        self._next_base = 0x0000000200000000
+        self._base_step = 0x02000000
 
         atexit.register(self.cleanup)
 
@@ -286,10 +300,26 @@ class DbgHelpResolver:
         self._modbase_by_path.clear()
 
 
-RESOLVER = DbgHelpResolver()
-
-
 class PE:
+    """
+    Stable usage:
+      pe = PE("...dll")
+      pe.address = 0  # if you want "offset mode"
+      x = pe["SymbolName"]  # returns address + rva (so address=0 => rva)
+
+    Multiple PE objects can be used in any order.
+    """
+    _cache_by_path = {}
+
+    @classmethod
+    def _get_cached(cls, path: str):
+        p = str(path)
+        obj = cls._cache_by_path.get(p)
+        if obj is None:
+            obj = PE(p)
+            cls._cache_by_path[p] = obj
+        return obj
+
     def __init__(self, path: str):
         self._path = str(path)
         self.pe = lief.PE.parse(self._path)
@@ -322,12 +352,8 @@ class PE:
 
         self._rsds = self._extract_rsds()
 
-        self._store = None          # SymbolStore (created lazily)
-        self._pdb_root_added = False
+        self._pdb_ready = False
         self._sym_rva_cache = {}
-
-    def set_imagebase(self, imagebase: int):
-        self.address = int(imagebase)
 
     def __getitem__(self, key):
         if key == "imagebase":
@@ -389,24 +415,26 @@ class PE:
         return None
 
     def _ensure_symbols(self):
-        if self._pdb_root_added:
+        if self._pdb_ready:
             return
         if not self._rsds:
             raise RuntimeError(f"No RSDS(CodeView) info found in {self._path}")
 
         pdb_name, guid, age = self._rsds
-        if self._store is None:
-            self._store = SymbolStore()
 
-        self._store.ensure_pdb(pdb_name, guid, age)
-        RESOLVER.add_search_dir(str(self._store.root))
-        self._pdb_root_added = True
+        store = _GlobalSymbolStore.inst()
+        store.ensure_pdb(pdb_name, guid, age)
+
+        resolver = _DbgHelpResolver.inst()
+        resolver.add_search_dir(str(store.root))
+
+        self._pdb_ready = True
 
     def _resolve_forward(self, fwd: str, depth: int = 0) -> int:
         if depth > 8:
             raise KeyError(f"forward depth exceeded: {fwd}")
 
-        fwd = fwd.strip()
+        fwd = (fwd or "").strip()
         if not fwd or "." not in fwd:
             raise KeyError(f"bad forward: {fwd}")
 
@@ -424,7 +452,7 @@ class PE:
 
             for tp in targets:
                 try:
-                    pe_t = PE(tp)
+                    pe_t = PE._get_cached(tp)
                     e = pe_t._exports_by_ordinal.get(ordv)
                     if not e:
                         continue
@@ -442,7 +470,7 @@ class PE:
 
         for tp in targets:
             try:
-                pe_t = PE(tp)
+                pe_t = PE._get_cached(tp)
                 info = pe_t.addr(sym)
                 if "forward" in info:
                     return pe_t._resolve_forward(info["forward"], depth + 1)
@@ -468,7 +496,9 @@ class PE:
             return self._sym_rva_cache[key]
 
         self._ensure_symbols()
-        rva = int(RESOLVER.sym_rva(self._path, name))
+
+        resolver = _DbgHelpResolver.inst()
+        rva = int(resolver.sym_rva(self._path, name))
         self._sym_rva_cache[key] = rva
         return rva
 
@@ -483,3 +513,51 @@ class PE:
         off = self.pe.rva_to_offset(rva)
         va = self.address + rva
         return {"name": name, "rva": rva, "va": va, "offset": off}
+
+    def get_exports(self):
+        out = []
+        for e in self._exports.values():
+            if getattr(e, "is_forwarded", False):
+                out.append({"name": e.name, "forward": getattr(e, "forward_information", None)})
+            else:
+                rva = int(getattr(e, "address", 0))
+                off = self.pe.rva_to_offset(rva)
+                va = self.address + rva
+                out.append({"name": e.name, "rva": rva, "va": va, "offset": off})
+        return out
+
+    def _iter_hits_in_section(self, sec, needle: bytes):
+        if not needle:
+            return
+        data = bytes(sec.content)
+        start = 0
+        while True:
+            idx = data.find(needle, start)
+            if idx < 0:
+                break
+            rva = sec.virtual_address + idx
+            yield rva
+            start = idx + 1
+
+    def find_string(self, s, wide=False):
+        if isinstance(s, bytes):
+            needle = s
+        else:
+            needle = s.encode("utf-16le") if wide else s.encode("ascii", "ignore")
+        for sec in self.pe.sections:
+            for rva in self._iter_hits_in_section(sec, needle):
+                yield self.address + rva
+
+    def find_string_info(self, s, wide=False):
+        if isinstance(s, bytes):
+            needle = s
+        else:
+            needle = s.encode("utf-16le") if wide else s.encode("ascii", "ignore")
+        for sec in self.pe.sections:
+            for rva in self._iter_hits_in_section(sec, needle):
+                yield {
+                    "va": self.address + rva,
+                    "rva": rva,
+                    "section": sec.name,
+                    "section_offset": rva - sec.virtual_address,
+                }
