@@ -261,6 +261,11 @@ class PE:
                 except Exception:
                     pass
 
+        self._imports = {}
+        for imp in self.pe.imports:
+            for entry in imp.entries:
+                self._imports[entry.name] = entry
+
         self._rsds = self._extract_rsds()
 
         self._tmp = None
@@ -295,6 +300,14 @@ class PE:
                 return info["va"]
             return info["va"]
         raise KeyError(key)
+    
+    @property
+    def imp(self, name: str) -> int:
+        entry = self._imports.get(name)
+        if not entry:
+            raise KeyError(f"import not found: {name}")
+        return self.address + entry.iat_address
+
 
     def _extract_rsds(self):
         for d in self.pe.debug:
