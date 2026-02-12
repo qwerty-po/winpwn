@@ -239,11 +239,17 @@ class PE:
         self.address = int(self.pe.optional_header.imagebase)
 
         exp = self.pe.get_export() if self.pe.has_exports else None
+        
         self._exports = {}
         if exp:
             for e in exp.entries:
                 if e.name:
                     self._exports[e.name.lower()] = e
+        
+        self._imports = {}
+        for import_dll in self.pe.imports:
+            for entry in import_dll.entries:
+                self._imports[entry.name] = entry.iat_address
 
         self._rsds = self._extract_rsds()
 
@@ -278,6 +284,12 @@ class PE:
                 raise KeyError(f'forwarded export: {key} -> {info["forward"]}')
             return info["va"]
         raise KeyError(key)
+    
+    def import_addr(self, name: str) -> int:
+        ia = self._imports.get(name)
+        if ia is None:
+            raise KeyError(f"import not found: {name}")
+        return ia
 
     def _extract_rsds(self):
         for d in self.pe.debug:
