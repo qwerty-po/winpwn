@@ -301,14 +301,12 @@ class PE:
             return info["va"]
         raise KeyError(key)
     
-    @property
     def imp(self, name: str) -> int:
         entry = self._imports.get(name)
         if not entry:
             raise KeyError(f"import not found: {name}")
         return self.address + entry.iat_address
-
-
+    
     def _extract_rsds(self):
         for d in self.pe.debug:
             if d.type != lief.PE.Debug.TYPES.CODEVIEW:
