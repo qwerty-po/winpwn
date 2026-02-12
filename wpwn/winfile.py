@@ -1,5 +1,6 @@
 import atexit
 import ctypes
+import os
 import pathlib
 import struct
 import tempfile
@@ -15,6 +16,14 @@ FILE_SHARE_READ = 0x00000001
 OPEN_EXISTING = 3
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def _is_py64() -> bool:
+    return ctypes.sizeof(ctypes.c_void_p) == 8
+
+
+def _is_pe64(pe: lief.PE.Binary) -> bool:
+    return int(pe.optional_header.magic) == int(lief.PE.PE_TYPE.PE32_PLUS)
 
 
 def _guid_bytes_to_symserv(g: bytes) -> str:
@@ -35,20 +44,77 @@ def _is_apiset(name: str) -> bool:
     return n.startswith("api-ms-") or n.startswith("ext-ms-")
 
 
-class _DbgHelpGlobal:
-    _inst = None
+class SymbolStore:
+    """
+    Per-PE symbol store that downloads PDB into a symserver-like layout:
+      <root>\<pdb_name>\<GUIDAGE>\<pdb_name>
+    and returns <root> for adding to dbghelp search path.
+    """
+    def __init__(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="symstore_")
+        self.root = pathlib.Path(self._tmp.name)
+        atexit.register(self.cleanup)
 
-    @classmethod
-    def inst(cls):
-        if cls._inst is None:
-            cls._inst = _DbgHelpGlobal()
-        return cls._inst
+    def cleanup(self):
+        try:
+            self._tmp.cleanup()
+        except Exception:
+            pass
 
+    def ensure_pdb(self, pdb_name: str, guid: bytes, age: int, timeout: int = 60) -> pathlib.Path:
+        guid_str = _guid_bytes_to_symserv(guid)
+        key = f"{guid_str}{age:X}"
+        out_path = self.root / pdb_name / key / pdb_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return out_path
+
+        url = f"{MS_SYMBOL_SERVER}/{pdb_name}/{key}/{pdb_name}"
+        r = requests.get(url, stream=True, timeout=timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"PDB download failed: HTTP {r.status_code} url={url}")
+
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+        return out_path
+
+
+class DbgHelpResolver:
+    """
+    Single dbghelp handler for the process (DbgHelp is process-global).
+    This class makes it safe for multiple PE instances by:
+      - never calling SymCleanup except at process exit
+      - maintaining a superset search path (only expands)
+      - assigning a unique fake base per loaded offline module to avoid collisions
+      - always querying with 'module!symbol'
+    """
     SYMOPT_UNDNAME = 0x00000002
     SYMOPT_DEFERRED_LOADS = 0x00000004
     SYMOPT_FAIL_CRITICAL_ERRORS = 0x00000200
     SYMOPT_NO_PROMPTS = 0x00080000
     SYMOPT_AUTO_PUBLICS = 0x00010000
+
+    class SYMBOL_INFOW(ctypes.Structure):
+        _fields_ = [
+            ("SizeOfStruct", wintypes.ULONG),
+            ("TypeIndex", wintypes.ULONG),
+            ("Reserved", ctypes.c_ulonglong * 2),
+            ("Index", wintypes.ULONG),
+            ("Size", wintypes.ULONG),
+            ("ModBase", ctypes.c_ulonglong),
+            ("Flags", wintypes.ULONG),
+            ("Value", ctypes.c_ulonglong),
+            ("Address", ctypes.c_ulonglong),
+            ("Register", wintypes.ULONG),
+            ("Scope", wintypes.ULONG),
+            ("Tag", wintypes.ULONG),
+            ("NameLen", wintypes.ULONG),
+            ("MaxNameLen", wintypes.ULONG),
+            ("Name", wintypes.WCHAR * 1),
+        ]
 
     def __init__(self):
         self.dbghelp = ctypes.WinDLL("dbghelp.dll")
@@ -106,29 +172,28 @@ class _DbgHelpGlobal:
         self._search_dirs = []
         self._modbase_by_path = {}
 
-        self._next_base = 0x0000000200000000
-        self._base_step = 0x00400000
+        self._next_base = 0x0000000200000000  # 8GB
+        self._base_step = 0x02000000          # 32MB
 
         atexit.register(self.cleanup)
 
-    class SYMBOL_INFOW(ctypes.Structure):
-        _fields_ = [
-            ("SizeOfStruct", wintypes.ULONG),
-            ("TypeIndex", wintypes.ULONG),
-            ("Reserved", ctypes.c_ulonglong * 2),
-            ("Index", wintypes.ULONG),
-            ("Size", wintypes.ULONG),
-            ("ModBase", ctypes.c_ulonglong),
-            ("Flags", wintypes.ULONG),
-            ("Value", ctypes.c_ulonglong),
-            ("Address", ctypes.c_ulonglong),
-            ("Register", wintypes.ULONG),
-            ("Scope", wintypes.ULONG),
-            ("Tag", wintypes.ULONG),
-            ("NameLen", wintypes.ULONG),
-            ("MaxNameLen", wintypes.ULONG),
-            ("Name", wintypes.WCHAR * 1),
-        ]
+    def _open_file(self, path: str):
+        h = self.kernel32.CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if ctypes.c_void_p(h).value == INVALID_HANDLE_VALUE:
+            raise RuntimeError(f"CreateFileW failed: GetLastError={self.kernel32.GetLastError()}")
+        return h
+
+    def _close_file(self, h):
+        if h and ctypes.c_void_p(h).value != INVALID_HANDLE_VALUE:
+            self.kernel32.CloseHandle(h)
 
     def ensure_init(self):
         if self._initialized:
@@ -152,29 +217,11 @@ class _DbgHelpGlobal:
         if d in self._search_dirs:
             return
         self._search_dirs.append(d)
-        path = ";".join(self._search_dirs)
-        ok = self.dbghelp.SymSetSearchPathW(self.proc, path)
+        combined = ";".join(self._search_dirs)
+        ok = self.dbghelp.SymSetSearchPathW(self.proc, combined)
         if not ok:
             raise RuntimeError(f"SymSetSearchPathW failed: GetLastError={self.kernel32.GetLastError()}")
         self.dbghelp.SymRefreshModuleList(self.proc)
-
-    def _open_file(self, path: str):
-        h = self.kernel32.CreateFileW(
-            path,
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-        if ctypes.c_void_p(h).value == INVALID_HANDLE_VALUE:
-            raise RuntimeError(f"CreateFileW failed: GetLastError={self.kernel32.GetLastError()}")
-        return h
-
-    def _close_file(self, h):
-        if h and ctypes.c_void_p(h).value != INVALID_HANDLE_VALUE:
-            self.kernel32.CloseHandle(h)
 
     def load_offline_module(self, image_path: str) -> int:
         self.ensure_init()
@@ -183,7 +230,6 @@ class _DbgHelpGlobal:
             return self._modbase_by_path[image_path]
 
         modname = pathlib.Path(image_path).stem
-
         base = self._next_base
         self._next_base += self._base_step
 
@@ -200,9 +246,8 @@ class _DbgHelpGlobal:
                 0,
             )
             if loaded == 0:
-                raise RuntimeError(
-                    f"SymLoadModuleExW failed: GetLastError={self.kernel32.GetLastError()} path={image_path}"
-                )
+                err = self.kernel32.GetLastError()
+                raise RuntimeError(f"SymLoadModuleExW failed: GetLastError={err} path={image_path}")
             modbase = int(loaded)
             self._modbase_by_path[image_path] = modbase
             return modbase
@@ -241,13 +286,19 @@ class _DbgHelpGlobal:
         self._modbase_by_path.clear()
 
 
+RESOLVER = DbgHelpResolver()
+
+
 class PE:
     def __init__(self, path: str):
-        self.pe = lief.PE.parse(path)
-        if self.pe is None:
-            raise RuntimeError(f"LIEF parse failed: {path}")
-
         self._path = str(path)
+        self.pe = lief.PE.parse(self._path)
+        if self.pe is None:
+            raise RuntimeError(f"LIEF parse failed: {self._path}")
+
+        if _is_pe64(self.pe) and not _is_py64():
+            raise RuntimeError("64-bit PE requires 64-bit Python")
+
         self._mod = pathlib.Path(self._path).stem
         self.address = int(self.pe.optional_header.imagebase)
 
@@ -271,22 +322,9 @@ class PE:
 
         self._rsds = self._extract_rsds()
 
-        self._tmp = None
-        self._pdb_local_dir = None
+        self._store = None          # SymbolStore (created lazily)
+        self._pdb_root_added = False
         self._sym_rva_cache = {}
-
-        self._cleaned = False
-        atexit.register(self.cleanup)
-
-    def cleanup(self):
-        if self._cleaned:
-            return
-        self._cleaned = True
-        try:
-            if self._tmp:
-                self._tmp.cleanup()
-        except Exception:
-            pass
 
     def set_imagebase(self, imagebase: int):
         self.address = int(imagebase)
@@ -298,8 +336,6 @@ class PE:
             return self.pe.rva_to_offset(self.pe.optional_header.addressof_entrypoint)
         if isinstance(key, str):
             info = self.addr(key)
-            if "forward" in info:
-                return info["va"]
             return info["va"]
         raise KeyError(key)
 
@@ -352,41 +388,26 @@ class PE:
 
         return None
 
-    def _ensure_pdb_dir_added(self):
-        if self._pdb_local_dir:
+    def _ensure_symbols(self):
+        if self._pdb_root_added:
             return
         if not self._rsds:
             raise RuntimeError(f"No RSDS(CodeView) info found in {self._path}")
 
         pdb_name, guid, age = self._rsds
-        guid_str = _guid_bytes_to_symserv(guid)
-        key = f"{guid_str}{age:X}"
-        url = f"{MS_SYMBOL_SERVER}/{pdb_name}/{key}/{pdb_name}"
+        if self._store is None:
+            self._store = SymbolStore()
 
-        if not self._tmp:
-            self._tmp = tempfile.TemporaryDirectory(prefix="pdb_")
+        self._store.ensure_pdb(pdb_name, guid, age)
+        RESOLVER.add_search_dir(str(self._store.root))
+        self._pdb_root_added = True
 
-        root = pathlib.Path(self._tmp.name)
-        out_path = root / pdb_name / key / pdb_name
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+    def _resolve_forward(self, fwd: str, depth: int = 0) -> int:
+        if depth > 8:
+            raise KeyError(f"forward depth exceeded: {fwd}")
 
-        if not out_path.exists() or out_path.stat().st_size == 0:
-            r = requests.get(url, stream=True, timeout=60)
-            if r.status_code != 200:
-                raise RuntimeError(f"PDB download failed: HTTP {r.status_code} url={url}")
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-        self._pdb_local_dir = str(root)
-        _DbgHelpGlobal.inst().add_search_dir(self._pdb_local_dir)
-
-    def _resolve_forward(self, fwd: str) -> int:
         fwd = fwd.strip()
-        if not fwd:
-            raise KeyError("empty forward")
-        if "." not in fwd:
+        if not fwd or "." not in fwd:
             raise KeyError(f"bad forward: {fwd}")
 
         dll, sym = fwd.split(".", 1)
@@ -395,13 +416,13 @@ class PE:
 
         if sym.startswith("#"):
             ordv = int(sym[1:])
-            target_paths = []
+            targets = []
             if _is_apiset(dll):
-                target_paths += [_system32_path("kernelbase"), _system32_path("ntdll")]
+                targets += [_system32_path("kernelbase"), _system32_path("ntdll")]
             else:
-                target_paths.append(_system32_path(dll))
+                targets.append(_system32_path(dll))
 
-            for tp in target_paths:
+            for tp in targets:
                 try:
                     pe_t = PE(tp)
                     e = pe_t._exports_by_ordinal.get(ordv)
@@ -413,16 +434,19 @@ class PE:
                     continue
             raise KeyError(f"forward ordinal not resolved: {fwd}")
 
-        target_paths = []
+        targets = []
         if _is_apiset(dll):
-            target_paths += [_system32_path("kernelbase"), _system32_path("ntdll")]
+            targets += [_system32_path("kernelbase"), _system32_path("ntdll")]
         else:
-            target_paths.append(_system32_path(dll))
+            targets.append(_system32_path(dll))
 
-        for tp in target_paths:
+        for tp in targets:
             try:
                 pe_t = PE(tp)
-                return pe_t["" + sym]
+                info = pe_t.addr(sym)
+                if "forward" in info:
+                    return pe_t._resolve_forward(info["forward"], depth + 1)
+                return info["va"]
             except Exception:
                 continue
 
@@ -431,8 +455,10 @@ class PE:
     def rva(self, name: str) -> int:
         key = name.lower()
 
-        e = self._exports.get(key)
+        e: lief.PE.ExportEntry = self._exports.get(key)
         if e:
+            if getattr(e, "is_forwarded", False):
+                raise KeyError(f"forwarded export: {name}")
             rva = getattr(e, "address", None)
             if rva is None:
                 raise KeyError(f"no RVA for: {name}")
@@ -441,9 +467,8 @@ class PE:
         if key in self._sym_rva_cache:
             return self._sym_rva_cache[key]
 
-        self._ensure_pdb_dir_added()
-        g = _DbgHelpGlobal.inst()
-        rva = int(g.sym_rva(self._path, name))
+        self._ensure_symbols()
+        rva = int(RESOLVER.sym_rva(self._path, name))
         self._sym_rva_cache[key] = rva
         return rva
 
