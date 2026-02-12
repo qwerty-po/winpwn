@@ -106,8 +106,8 @@ class _DbgHelpGlobal:
         self._search_dirs = []
         self._modbase_by_path = {}
 
-        self._next_base = 0x0000000200000000  # 8GB
-        self._base_step = 0x00200000          # 2MB
+        self._next_base = 0x0000000200000000
+        self._base_step = 0x00400000
 
         atexit.register(self.cleanup)
 
@@ -200,7 +200,9 @@ class _DbgHelpGlobal:
                 0,
             )
             if loaded == 0:
-                raise RuntimeError(f"SymLoadModuleExW failed: GetLastError={self.kernel32.GetLastError()} path={image_path}")
+                raise RuntimeError(
+                    f"SymLoadModuleExW failed: GetLastError={self.kernel32.GetLastError()} path={image_path}"
+                )
             modbase = int(loaded)
             self._modbase_by_path[image_path] = modbase
             return modbase
@@ -264,7 +266,8 @@ class PE:
         self._imports = {}
         for imp in self.pe.imports:
             for entry in imp.entries:
-                self._imports[entry.name] = entry
+                if entry.name:
+                    self._imports[entry.name.lower()] = entry
 
         self._rsds = self._extract_rsds()
 
@@ -296,17 +299,16 @@ class PE:
         if isinstance(key, str):
             info = self.addr(key)
             if "forward" in info:
-                # now we resolve forward instead of raising
                 return info["va"]
             return info["va"]
         raise KeyError(key)
-    
+
     def imp(self, name: str) -> int:
-        entry = self._imports.get(name)
+        entry = self._imports.get(name.lower())
         if not entry:
             raise KeyError(f"import not found: {name}")
-        return self.address + entry.iat_address
-    
+        return self.address + int(entry.iat_address)
+
     def _extract_rsds(self):
         for d in self.pe.debug:
             if d.type != lief.PE.Debug.TYPES.CODEVIEW:
@@ -364,29 +366,26 @@ class PE:
         if not self._tmp:
             self._tmp = tempfile.TemporaryDirectory(prefix="pdb_")
 
-        out_path = pathlib.Path(self._tmp.name) / pdb_name
-        r = requests.get(url, stream=True, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"PDB download failed: HTTP {r.status_code} url={url}")
+        root = pathlib.Path(self._tmp.name)
+        out_path = root / pdb_name / key / pdb_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            r = requests.get(url, stream=True, timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"PDB download failed: HTTP {r.status_code} url={url}")
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
 
-        self._pdb_local_dir = str(out_path.parent)
+        self._pdb_local_dir = str(root)
         _DbgHelpGlobal.inst().add_search_dir(self._pdb_local_dir)
 
     def _resolve_forward(self, fwd: str) -> int:
-        # fwd examples:
-        #   "KERNELBASE.Sleep"
-        #   "ntdll.RtlAllocateHeap"
-        #   "api-ms-win-core-synch-l1-2-0.Sleep"
-        #   "KERNELBASE.#123"
         fwd = fwd.strip()
         if not fwd:
             raise KeyError("empty forward")
-
         if "." not in fwd:
             raise KeyError(f"bad forward: {fwd}")
 
@@ -394,13 +393,10 @@ class PE:
         dll = dll.strip()
         sym = sym.strip()
 
-        # ordinal forward
         if sym.startswith("#"):
-            # We can only resolve ordinal if we can open the target DLL and it has that ordinal exported.
             ordv = int(sym[1:])
             target_paths = []
             if _is_apiset(dll):
-                # best-effort fallback for apiset forwards
                 target_paths += [_system32_path("kernelbase"), _system32_path("ntdll")]
             else:
                 target_paths.append(_system32_path(dll))
@@ -415,10 +411,8 @@ class PE:
                     return pe_t.address + rva
                 except Exception:
                     continue
-
             raise KeyError(f"forward ordinal not resolved: {fwd}")
 
-        # name forward
         target_paths = []
         if _is_apiset(dll):
             target_paths += [_system32_path("kernelbase"), _system32_path("ntdll")]
@@ -439,8 +433,6 @@ class PE:
 
         e = self._exports.get(key)
         if e:
-            # forwarded export => resolve to target and convert to RVA relative to THIS module? Not meaningful.
-            # For caller, we want final VA, so handle in addr().
             rva = getattr(e, "address", None)
             if rva is None:
                 raise KeyError(f"no RVA for: {name}")
