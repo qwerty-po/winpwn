@@ -23,6 +23,18 @@ def _guid_bytes_to_symserv(g: bytes) -> str:
     return f"{d1:08X}{d2:04X}{d3:04X}{d4.hex().upper()}"
 
 
+def _system32_path(dll_name: str) -> str:
+    dll_name = dll_name.lower()
+    if not dll_name.endswith(".dll"):
+        dll_name += ".dll"
+    return str(pathlib.Path(r"C:\Windows\System32") / dll_name)
+
+
+def _is_apiset(name: str) -> bool:
+    n = name.lower()
+    return n.startswith("api-ms-") or n.startswith("ext-ms-")
+
+
 class _DbgHelpGlobal:
     _inst = None
 
@@ -91,12 +103,11 @@ class _DbgHelpGlobal:
         self.kernel32.CloseHandle.restype = wintypes.BOOL
 
         self._initialized = False
-        self._search_dirs = []          # list[str]
-        self._modbase_by_path = {}      # path -> modbase (int)
+        self._search_dirs = []
+        self._modbase_by_path = {}
 
-        # Pick a fake base range unlikely to collide. Must be aligned.
         self._next_base = 0x0000000200000000  # 8GB
-        self._base_step = 0x00100000          # 1MB
+        self._base_step = 0x00200000          # 2MB
 
         atexit.register(self.cleanup)
 
@@ -189,7 +200,7 @@ class _DbgHelpGlobal:
                 0,
             )
             if loaded == 0:
-                raise RuntimeError(f"SymLoadModuleExW failed: GetLastError={self.kernel32.GetLastError()}")
+                raise RuntimeError(f"SymLoadModuleExW failed: GetLastError={self.kernel32.GetLastError()} path={image_path}")
             modbase = int(loaded)
             self._modbase_by_path[image_path] = modbase
             return modbase
@@ -229,7 +240,7 @@ class _DbgHelpGlobal:
 
 
 class PE:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.pe = lief.PE.parse(path)
         if self.pe is None:
             raise RuntimeError(f"LIEF parse failed: {path}")
@@ -239,17 +250,16 @@ class PE:
         self.address = int(self.pe.optional_header.imagebase)
 
         exp = self.pe.get_export() if self.pe.has_exports else None
-        
         self._exports = {}
+        self._exports_by_ordinal = {}
         if exp:
             for e in exp.entries:
                 if e.name:
                     self._exports[e.name.lower()] = e
-        
-        self._imports = {}
-        for import_dll in self.pe.imports:
-            for entry in import_dll.entries:
-                self._imports[entry.name] = entry.iat_address
+                try:
+                    self._exports_by_ordinal[int(e.ordinal)] = e
+                except Exception:
+                    pass
 
         self._rsds = self._extract_rsds()
 
@@ -281,22 +291,16 @@ class PE:
         if isinstance(key, str):
             info = self.addr(key)
             if "forward" in info:
-                raise KeyError(f'forwarded export: {key} -> {info["forward"]}')
+                # now we resolve forward instead of raising
+                return info["va"]
             return info["va"]
         raise KeyError(key)
-    
-    def import_addr(self, name: str) -> int:
-        ia = self._imports.get(name)
-        if ia is None:
-            raise KeyError(f"import not found: {name}")
-        return ia + self.address
 
     def _extract_rsds(self):
         for d in self.pe.debug:
             if d.type != lief.PE.Debug.TYPES.CODEVIEW:
                 continue
 
-            # raw payload
             if hasattr(d, "payload"):
                 buf = bytes(d.payload)
                 if len(buf) >= 24 and buf[:4] == b"RSDS":
@@ -306,7 +310,6 @@ class PE:
                     pdb_name = pathlib.Path(pdb_path).name
                     return pdb_name, guid, int(age)
 
-            # structured CodeViewPDB variant
             pdb_name = None
             for pfield in ("path", "filename", "pdb_path", "pdb_filename"):
                 if hasattr(d, pfield):
@@ -340,7 +343,7 @@ class PE:
         if self._pdb_local_dir:
             return
         if not self._rsds:
-            raise RuntimeError("No RSDS(CodeView) info found")
+            raise RuntimeError(f"No RSDS(CodeView) info found in {self._path}")
 
         pdb_name, guid, age = self._rsds
         guid_str = _guid_bytes_to_symserv(guid)
@@ -361,14 +364,72 @@ class PE:
                     f.write(chunk)
 
         self._pdb_local_dir = str(out_path.parent)
-        g = _DbgHelpGlobal.inst()
-        g.add_search_dir(self._pdb_local_dir)
+        _DbgHelpGlobal.inst().add_search_dir(self._pdb_local_dir)
+
+    def _resolve_forward(self, fwd: str) -> int:
+        # fwd examples:
+        #   "KERNELBASE.Sleep"
+        #   "ntdll.RtlAllocateHeap"
+        #   "api-ms-win-core-synch-l1-2-0.Sleep"
+        #   "KERNELBASE.#123"
+        fwd = fwd.strip()
+        if not fwd:
+            raise KeyError("empty forward")
+
+        if "." not in fwd:
+            raise KeyError(f"bad forward: {fwd}")
+
+        dll, sym = fwd.split(".", 1)
+        dll = dll.strip()
+        sym = sym.strip()
+
+        # ordinal forward
+        if sym.startswith("#"):
+            # We can only resolve ordinal if we can open the target DLL and it has that ordinal exported.
+            ordv = int(sym[1:])
+            target_paths = []
+            if _is_apiset(dll):
+                # best-effort fallback for apiset forwards
+                target_paths += [_system32_path("kernelbase"), _system32_path("ntdll")]
+            else:
+                target_paths.append(_system32_path(dll))
+
+            for tp in target_paths:
+                try:
+                    pe_t = PE(tp)
+                    e = pe_t._exports_by_ordinal.get(ordv)
+                    if not e:
+                        continue
+                    rva = int(getattr(e, "address", 0))
+                    return pe_t.address + rva
+                except Exception:
+                    continue
+
+            raise KeyError(f"forward ordinal not resolved: {fwd}")
+
+        # name forward
+        target_paths = []
+        if _is_apiset(dll):
+            target_paths += [_system32_path("kernelbase"), _system32_path("ntdll")]
+        else:
+            target_paths.append(_system32_path(dll))
+
+        for tp in target_paths:
+            try:
+                pe_t = PE(tp)
+                return pe_t["" + sym]
+            except Exception:
+                continue
+
+        raise KeyError(f"forward not resolved: {fwd}")
 
     def rva(self, name: str) -> int:
         key = name.lower()
 
         e = self._exports.get(key)
         if e:
+            # forwarded export => resolve to target and convert to RVA relative to THIS module? Not meaningful.
+            # For caller, we want final VA, so handle in addr().
             rva = getattr(e, "address", None)
             if rva is None:
                 raise KeyError(f"no RVA for: {name}")
@@ -378,7 +439,6 @@ class PE:
             return self._sym_rva_cache[key]
 
         self._ensure_pdb_dir_added()
-
         g = _DbgHelpGlobal.inst()
         rva = int(g.sym_rva(self._path, name))
         self._sym_rva_cache[key] = rva
@@ -387,27 +447,11 @@ class PE:
     def addr(self, name: str):
         e: lief.PE.ExportEntry = self._exports.get(name.lower())
         if e and getattr(e, "is_forwarded", False):
-            fwd = getattr(e, "forward_information", None)
-            return {"name": e.name, "forward": fwd or "<unknown>"}
+            fwd = getattr(e, "forward_information", None) or ""
+            va = self._resolve_forward(fwd)
+            return {"name": e.name, "forward": fwd, "va": va}
 
         rva = self.rva(name)
         off = self.pe.rva_to_offset(rva)
         va = self.address + rva
         return {"name": name, "rva": rva, "va": va, "offset": off}
-    
-    def find_string(self, s: str, encoding="utf-8", add_null=True):
-        needle = s.encode(encoding) + (b"\x00" if add_null else b"")
-
-        for sec in self.pe.sections:
-            data = bytes(sec.content)  # 섹션 raw bytes
-            pos = 0
-            while True:
-                idx = data.find(needle, pos)
-                if idx == -1:
-                    break
-
-                rva = sec.virtual_address + idx
-                va  = self.address + rva
-                
-                yield va
-                pos = idx + 1
